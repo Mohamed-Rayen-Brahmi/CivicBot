@@ -125,6 +125,27 @@ def get_context_payload() -> Dict[str, Any]:
         }
 
 
+def get_location_text(location: Optional[Dict[str, Any]] = None) -> str:
+    with _lock:
+        loc = dict(location) if location is not None else _latest_context.get("location")
+
+    if not loc:
+        return "unknown location"
+
+    geo = _reverse_geocode(loc)
+    place = geo.get("place", "unknown")
+    state = geo.get("state", "unknown")
+
+    # Keep the location string English and explicit for prompt usage.
+    if place != "unknown" and state != "unknown":
+        return f"{place}, {state}, Tunisia"
+    if place != "unknown":
+        return f"{place}, Tunisia"
+    if state != "unknown":
+        return f"{state}, Tunisia"
+    return "unknown location in Tunisia"
+
+
 def update_runtime_config(min_confidence: Optional[float] = None) -> Dict[str, Any]:
     global ROBOFLOW_MIN_CONFIDENCE
 
@@ -585,14 +606,7 @@ def _analyze_frame(frame: np.ndarray) -> str:
     else:
         logger.info("[CV] RoadDamage disabled (missing key/model).")
 
-    key_targets = [
-        l for l in detected_labels if l in {"person", "car", "motorcycle", "traffic light"}
-    ]
-
-    parts = [
-        f"YOLO key detections: {', '.join(key_targets[:8]) if key_targets else 'none'}.",
-        f"Traffic light status: {'RED' if red_light else 'not red/unknown'}.",
-    ]
+    parts: List[str] = []
 
     if road_damage.get("enabled"):
         labels = road_damage.get("labels", [])

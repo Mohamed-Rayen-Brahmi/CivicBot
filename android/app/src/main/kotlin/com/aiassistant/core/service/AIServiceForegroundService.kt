@@ -7,7 +7,10 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationManager
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.IBinder
+import android.os.Build
 import android.os.PowerManager
 import android.os.Looper
 import androidx.camera.core.CameraSelector
@@ -152,10 +155,8 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
         } catch (e: Exception) {
             Timber.e(e, "Audio pipeline failed to start")
         }
-        
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-        audioManager.mode = android.media.AudioManager.MODE_NORMAL
-        audioManager.isSpeakerphoneOn = false
+
+        configureSpeakerOutput(enable = true)
 
         // Bind CameraX
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -283,12 +284,32 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
         wsManager.disconnect()
         audioPipeline.stopRecording()
         audioPipeline.stopPlayback()
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-        audioManager.mode = android.media.AudioManager.MODE_NORMAL
-        audioManager.isSpeakerphoneOn = false
+        configureSpeakerOutput(enable = false)
         wakeLock?.release()
         serviceScope.cancel()
         cameraExecutor.shutdown()
+    }
+
+    private fun configureSpeakerOutput(enable: Boolean) {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager.mode = AudioManager.MODE_NORMAL
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (enable) {
+                val speaker = audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+                }
+                if (speaker != null) {
+                    audioManager.setCommunicationDevice(speaker)
+                }
+            } else {
+                audioManager.clearCommunicationDevice()
+            }
+        }
+
+        // Deprecated but still useful on many OEM builds for forcing loudspeaker route.
+        audioManager.isSpeakerphoneOn = enable
+        Timber.i("Speaker output %s", if (enable) "enabled" else "disabled")
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

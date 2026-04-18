@@ -88,12 +88,18 @@ def _normalize_keep_alive(value: str):
 OLLAMA_KEEP_ALIVE_VALUE = _normalize_keep_alive(OLLAMA_KEEP_ALIVE)
 
 SYSTEM_PROMPT = (
-    "You are CivicBot, a concise road-assistant robot. "
-    "Respond in plain language, max 2 short sentences. "
-    "Prioritize: 1) safety, 2) clarity, 3) actionable next step. "
-    "If user audio is unclear, politely ask a short clarification question. "
-    "Avoid technical jargon and avoid meta comments. "
-    "Local context: ISET Bizerte and surrounding Bizerte areas in Tunisia."
+    "You are CivicBot, a civic assistant for Bizerte Governorate, Tunisia. "
+    "Always answer in English, regardless of the transcription language. "
+    "You are allowed to help only with: "
+    "(1) navigation and directions, "
+    "(2) local civic guidance (services, transport options, practical local movement), "
+    "(3) currency conversion (for example USD to TND). "
+    "If the request is outside these categories, reply with: "
+    "I'm only able to help with navigation, directions, or civic questions. "
+    "For 'where are we' questions, use the provided GPS location context explicitly. "
+    "For direction questions, give practical local advice in Bizerte/Tunisia context "
+    "(for example taxi stands, louage/shared taxis, and STB buses). "
+    "Keep answers concise: max 2 short sentences unless user asks for more detail."
 )
 
 MAX_HISTORY_TURNS = 5
@@ -192,7 +198,7 @@ def _synthesize_tts_pcm_chunks(text: str) -> list[bytes]:
 
         # audio is typically float32 at 24kHz
         resampled_audio = scipy.signal.resample_poly(audio, 16000, 24000)
-        pcm_audio = (resampled_audio * 1.5 * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+        pcm_audio = (resampled_audio * 4.0 * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
         chunks.append(pcm_audio)
 
     return chunks
@@ -264,6 +270,16 @@ async def call_llm(prompt: str, ws, emotion_callback):
     logger.info(f"LLM Prompt: {prompt}")
 
     cv_context = cv_module.get_context()
+    cv_payload = cv_module.get_context_payload()
+    location = cv_payload.get("location") if isinstance(cv_payload, dict) else None
+    lat = location.get("latitude") if isinstance(location, dict) else None
+    lon = location.get("longitude") if isinstance(location, dict) else None
+    location_text = cv_module.get_location_text(location if isinstance(location, dict) else None)
+    if lat is not None and lon is not None:
+        gps_line = f"Current GPS location: {location_text} (lat: {lat}, lon: {lon})"
+    else:
+        gps_line = "Current GPS location: unavailable"
+
     history_block = "\n".join(
         [
             f"Turn {i + 1} User: {turn['user']}\nTurn {i + 1} Assistant: {turn['assistant']}"
@@ -273,6 +289,7 @@ async def call_llm(prompt: str, ws, emotion_callback):
 
     composed_user_prompt = (
         f"Conversation history (latest first):\n{history_block if history_block else '(none)'}\n\n"
+        f"{gps_line}\n\n"
         f"Camera context: {cv_context}\n\n"
         f"Current user message: {prompt}"
     )
