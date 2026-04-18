@@ -1,0 +1,10 @@
+faster-whisper
+kokoro
+soundfile
+websockets
+numpy
+scipy
+requests
+ultralytics
+opencv-python-headless
+inference-sdk

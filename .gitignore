@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env
+.pytest_cache/
+*.log
+
+# Android
+.gradle/
+local.properties
+.idea/
+.projects
+build/
+android/app/build/
+android/.gradle/
+android/local.properties
+android/captures/
+*.apk
+*.aar
+*.jks
+
+# IDEs
+.vscode/
+.DS_Store
+*.zip
+
+# Node (if any)
+node_modules/
+dist/
+
+# Runtime artifacts / local data
+cache/
+reports/
+models/
+
+# Duplicate nested copy of the project
+CivicBot-Local-Dual-Link-AI-Voice-Pipeline-main/

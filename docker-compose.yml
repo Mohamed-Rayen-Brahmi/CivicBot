@@ -1,0 +1,46 @@
+services:
+  civicbot-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: civicbot-backend
+    env_file:
+      - .env
+    ports:
+      - "8765:8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./reports:/app/reports
+      - ./models:/app/models
+      - ./cache/huggingface:/root/.cache/huggingface
+      - ./cache/ultralytics:/tmp/Ultralytics
+    restart: unless-stopped
+
+  civicbot-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: civicbot-web
+    ports:
+      - "3000:80"
+    depends_on:
+      - civicbot-backend
+    restart: unless-stopped
+
+  civicbot-ollama:
+    image: ollama/ollama:latest
+    container_name: civicbot-ollama
+    profiles: ["with-ollama"]
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=0
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

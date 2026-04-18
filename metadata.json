@@ -1,0 +1,8 @@
+{
+  "name": "Core Engine V1.0",
+  "description": "Local AI Assistant Endpoint with real-time camera streaming, microphone capture, and low-latency TTS playback over Tailscale.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
