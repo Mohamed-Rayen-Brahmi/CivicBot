@@ -41,7 +41,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("AIPipeline")
 
 # --- Configuration ---
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://host.docker.internal:11434/api/generate")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://100.120.177.99:11434/api/chat")
 MODEL_NAME = os.getenv("MODEL_NAME", "tinyllama")
 MODEL_FALLBACK = os.getenv("MODEL_FALLBACK", "tinyllama:latest")
 WS_PORT = int(os.getenv("WS_PORT", "8765"))
@@ -69,6 +69,24 @@ AUDIO_ENERGY_THRESHOLD = float(os.getenv("AUDIO_ENERGY_THRESHOLD", "0.0004"))
 STT_CHUNK_BYTES = int(os.getenv("STT_CHUNK_BYTES", "32000"))
 PRELOAD_AUDIO_MODELS = os.getenv("PRELOAD_AUDIO_MODELS", "true").strip().lower() in {"1", "true", "yes", "on"}
 OLLAMA_REQUEST_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "60"))
+
+
+def _resolve_ollama_chat_url(raw_url: str) -> str:
+    url = (raw_url or "").strip()
+    if not url:
+        return "http://100.120.177.99:11434/api/chat"
+
+    lower = url.lower()
+    if lower.endswith("/api/generate"):
+        return url[: -len("/api/generate")] + "/api/chat"
+    if lower.endswith("/api/chat"):
+        return url
+    if "/api/" in lower:
+        return url.rstrip("/")
+    return url.rstrip("/") + "/api/chat"
+
+
+OLLAMA_CHAT_URL = _resolve_ollama_chat_url(OLLAMA_URL)
 
 
 def _normalize_keep_alive(value: str):
@@ -248,6 +266,7 @@ def process_audio_buffer(pcm_data: bytes) -> str:
     transcribe_kwargs = {
         "beam_size": 1,
         "vad_filter": WHISPER_VAD_FILTER,
+        "task": "translate",
     }
     if WHISPER_LANGUAGE and WHISPER_LANGUAGE.lower() != "auto":
         transcribe_kwargs["language"] = WHISPER_LANGUAGE
@@ -280,23 +299,28 @@ async def call_llm(prompt: str, ws, emotion_callback):
     else:
         gps_line = "Current GPS location: unavailable"
 
-    history_block = "\n".join(
-        [
-            f"Turn {i + 1} User: {turn['user']}\nTurn {i + 1} Assistant: {turn['assistant']}"
-            for i, turn in enumerate(conversation_history[-MAX_HISTORY_TURNS:])
-        ]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in conversation_history[-MAX_HISTORY_TURNS:]:
+        user_text = str(turn.get("user", "")).strip()
+        assistant_text = str(turn.get("assistant", "")).strip()
+        if user_text:
+            messages.append({"role": "user", "content": user_text})
+        if assistant_text:
+            messages.append({"role": "assistant", "content": assistant_text})
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"{gps_line}\n\n"
+                f"Camera context: {cv_context}\n\n"
+                f"User message: {prompt}"
+            ),
+        }
     )
 
-    composed_user_prompt = (
-        f"Conversation history (latest first):\n{history_block if history_block else '(none)'}\n\n"
-        f"{gps_line}\n\n"
-        f"Camera context: {cv_context}\n\n"
-        f"Current user message: {prompt}"
-    )
-    
     base_payload = {
-        "system": SYSTEM_PROMPT,
-        "prompt": composed_user_prompt,
+        "messages": messages,
         "stream": True,
         "options": {
             "temperature": OLLAMA_TEMPERATURE,
@@ -316,7 +340,7 @@ async def call_llm(prompt: str, ws, emotion_callback):
         try:
             def fetch_stream():
                 return requests.post(
-                    OLLAMA_URL,
+                    OLLAMA_CHAT_URL,
                     json=payload,
                     stream=True,
                     timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
@@ -338,7 +362,12 @@ async def call_llm(prompt: str, ws, emotion_callback):
                     raise item
 
                 data = json.loads(item)
-                word = data.get("response", "")
+                if data.get("error"):
+                    raise RuntimeError(str(data.get("error")))
+
+                word = data.get("message", {}).get("content", "")
+                if not word:
+                    continue
                 sentence_buffer += word
                 full_assistant_text += word
 

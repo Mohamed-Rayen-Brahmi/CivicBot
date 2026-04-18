@@ -190,7 +190,10 @@ def _reverse_geocode(location: Optional[Dict[str, Any]]) -> Dict[str, str]:
                 "zoom": 14,
                 "addressdetails": 1,
             },
-            headers={"User-Agent": REVERSE_GEOCODE_USER_AGENT},
+            headers={
+                "User-Agent": REVERSE_GEOCODE_USER_AGENT,
+                "Accept-Language": "en",
+            },
             timeout=REVERSE_GEOCODE_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
