@@ -6,9 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
-import android.location.LocationListener
 import android.location.LocationManager
-import android.os.Bundle
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.Looper
@@ -18,6 +16,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationListenerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.LifecycleRegistry
@@ -44,7 +43,7 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
     
     private val cameraExecutor = Executors.newSingleThreadExecutor()
 
-    private val locationListener = object : LocationListener {
+    private val locationListener = object : LocationListenerCompat {
         override fun onLocationChanged(location: Location) {
             handleLocation(location)
         }
@@ -57,10 +56,6 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
             Timber.w("Location provider disabled: %s", provider)
         }
 
-        @Suppress("DEPRECATION")
-        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
-            // Required for pre-Android 10 devices; no-op.
-        }
     }
 
     override fun onCreate() {
@@ -85,8 +80,11 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
         wsManager = WebSocketClientManager(
             serviceScope,
             onTextReceived = { msg ->
-                ServiceEventBus.tryEmit(ServiceEvent.TextReceived(msg))
-                Timber.d("Received text: ${msg.text}")
+                val text = msg.text?.trim()
+                if (!text.isNullOrEmpty()) {
+                    ServiceEventBus.tryEmit(ServiceEvent.TextReceived(msg))
+                    Timber.d("Received text: %s", text)
+                }
             },
             onAudioReceived = { audio ->
                 audioPipeline.enqueuePlayback(audio)
@@ -156,8 +154,8 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
         }
         
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
-        audioManager.mode = android.media.AudioManager.MODE_IN_COMMUNICATION
-        audioManager.isSpeakerphoneOn = com.aiassistant.core.config.ConfigManager.currentConfig.useSpeakerphone
+        audioManager.mode = android.media.AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = false
 
         // Bind CameraX
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -185,7 +183,7 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
     private fun acquireWakeLock() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AIAssistant:WakeLock")
-        wakeLock?.acquire(300000L)
+        wakeLock?.acquire(3 * 60 * 60 * 1000L)
     }
 
     private fun hasLocationPermission(): Boolean {
@@ -285,6 +283,9 @@ class AIServiceForegroundService : Service(), LifecycleOwner {
         wsManager.disconnect()
         audioPipeline.stopRecording()
         audioPipeline.stopPlayback()
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        audioManager.mode = android.media.AudioManager.MODE_NORMAL
+        audioManager.isSpeakerphoneOn = false
         wakeLock?.release()
         serviceScope.cancel()
         cameraExecutor.shutdown()

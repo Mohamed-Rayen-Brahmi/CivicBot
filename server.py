@@ -70,6 +70,23 @@ STT_CHUNK_BYTES = int(os.getenv("STT_CHUNK_BYTES", "32000"))
 PRELOAD_AUDIO_MODELS = os.getenv("PRELOAD_AUDIO_MODELS", "true").strip().lower() in {"1", "true", "yes", "on"}
 OLLAMA_REQUEST_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_REQUEST_TIMEOUT_SECONDS", "60"))
 
+
+def _normalize_keep_alive(value: str):
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    # Older/newer Ollama builds may parse plain numeric strings differently.
+    # Send integers as JSON numbers (e.g., -1) instead of strings ("-1").
+    if raw.lstrip("+-").isdigit():
+        try:
+            return int(raw)
+        except Exception:
+            return raw
+    return raw
+
+
+OLLAMA_KEEP_ALIVE_VALUE = _normalize_keep_alive(OLLAMA_KEEP_ALIVE)
+
 SYSTEM_PROMPT = (
     "You are CivicBot, a concise road-assistant robot. "
     "Respond in plain language, max 2 short sentences. "
@@ -97,8 +114,6 @@ class PipelineState:
         self.last_voice_timestamp = 0.0
         self.flush_task = None
         self.stt_busy = False
-        
-state = PipelineState()
 
 
 def _is_preferred_location_source(source: str) -> bool:
@@ -121,19 +136,11 @@ async def _preload_audio_models_async() -> None:
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _preload_audio_models_sync)
 
+
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is not None:
         return _whisper_model
-
-
-def _get_llm_candidates() -> list[str]:
-    candidates = []
-    for name in [MODEL_NAME, MODEL_FALLBACK]:
-        clean = (name or "").strip()
-        if clean and clean not in candidates:
-            candidates.append(clean)
-    return candidates
 
     with _whisper_lock:
         if _whisper_model is not None:
@@ -153,6 +160,42 @@ def _get_llm_candidates() -> list[str]:
             logger.info("Faster-Whisper loaded on CPU (int8 fallback).")
 
         return _whisper_model
+
+
+def _get_llm_candidates() -> list[str]:
+    candidates = []
+    for name in [MODEL_NAME, MODEL_FALLBACK]:
+        clean = (name or "").strip()
+        if clean and clean not in candidates:
+            candidates.append(clean)
+    return candidates
+
+
+def _iter_lines_worker(response: requests.Response, loop: asyncio.AbstractEventLoop, q: asyncio.Queue):
+    try:
+        for line in response.iter_lines():
+            if line:
+                loop.call_soon_threadsafe(q.put_nowait, line)
+    except Exception as stream_exc:
+        loop.call_soon_threadsafe(q.put_nowait, stream_exc)
+    finally:
+        loop.call_soon_threadsafe(q.put_nowait, None)
+
+
+def _synthesize_tts_pcm_chunks(text: str) -> list[bytes]:
+    chunks: list[bytes] = []
+    kokoro_pipeline = get_kokoro_pipeline()
+    generator = kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
+    for _, (_, _, audio) in enumerate(generator):
+        if audio is None:
+            continue
+
+        # audio is typically float32 at 24kHz
+        resampled_audio = scipy.signal.resample_poly(audio, 16000, 24000)
+        pcm_audio = (resampled_audio * 1.5 * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+        chunks.append(pcm_audio)
+
+    return chunks
 
 
 def get_kokoro_pipeline():
@@ -238,13 +281,14 @@ async def call_llm(prompt: str, ws, emotion_callback):
         "system": SYSTEM_PROMPT,
         "prompt": composed_user_prompt,
         "stream": True,
-        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "temperature": OLLAMA_TEMPERATURE,
             "num_predict": OLLAMA_NUM_PREDICT,
             "num_ctx": OLLAMA_NUM_CTX,
         },
     }
+    if OLLAMA_KEEP_ALIVE_VALUE is not None:
+        base_payload["keep_alive"] = OLLAMA_KEEP_ALIVE_VALUE
     
     # Use loop executor to avoid blocking the websocket while waiting for the slow LLM
     loop = asyncio.get_event_loop()
@@ -266,25 +310,34 @@ async def call_llm(prompt: str, ws, emotion_callback):
 
             sentence_buffer = ""
             full_assistant_text = ""
-            # The iteration itself should be done carefully
-            for line in response.iter_lines():
-                if line:
-                    data = json.loads(line)
-                    word = data.get("response", "")
-                    sentence_buffer += word
-                    full_assistant_text += word
+            stream_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
+            line_reader_future = loop.run_in_executor(None, _iter_lines_worker, response, loop, stream_queue)
 
-                    # if we hit a sentence or significant pause boundary, stream to TTS
-                    if any(punct in word for punct in ['.', '!', '?', ';', ',']):
-                        # Only chunk on comma if we have a bit of text to make it sound natural
-                        if ',' in word and len(sentence_buffer) < 40:
-                            continue
+            while True:
+                item = await stream_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
 
-                        await process_tts_and_send(sentence_buffer.strip(), ws)
-                        sentence_buffer = ""
-                    elif len(sentence_buffer) >= TTS_CHUNK_MAX_CHARS:
-                        await process_tts_and_send(sentence_buffer.strip(), ws)
-                        sentence_buffer = ""
+                data = json.loads(item)
+                word = data.get("response", "")
+                sentence_buffer += word
+                full_assistant_text += word
+
+                # if we hit a sentence or significant pause boundary, stream to TTS
+                if any(punct in word for punct in ['.', '!', '?', ';', ',']):
+                    # Only chunk on comma if we have a bit of text to make it sound natural
+                    if ',' in word and len(sentence_buffer) < 40:
+                        continue
+
+                    await process_tts_and_send(sentence_buffer.strip(), ws)
+                    sentence_buffer = ""
+                elif len(sentence_buffer) >= TTS_CHUNK_MAX_CHARS:
+                    await process_tts_and_send(sentence_buffer.strip(), ws)
+                    sentence_buffer = ""
+
+            await line_reader_future
 
             if sentence_buffer:
                 await process_tts_and_send(sentence_buffer.strip(), ws)
@@ -299,7 +352,16 @@ async def call_llm(prompt: str, ws, emotion_callback):
             return
         except Exception as e:
             last_error = e
-            logger.warning("LLM model '%s' failed: %s", candidate, e)
+            err_detail = str(e)
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body = (resp.text or "").strip()
+                    if body:
+                        err_detail = f"{err_detail} | body={body[:300]}"
+                except Exception:
+                    pass
+            logger.warning("LLM model '%s' failed: %s", candidate, err_detail)
 
     logger.error("Ollama API failed for all configured models: %s", last_error)
     await ws.send(json.dumps({"type": "llm", "text": f"Error thinking: {last_error}", "emotion": "sad"}))
@@ -314,32 +376,22 @@ async def process_tts_and_send(text: str, ws):
     await ws.send(json.dumps({"type": "llm", "text": text, "emotion": "talking"}))
     
     try:
-        kokoro_pipeline = get_kokoro_pipeline()
-        generator = kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
-        for i, (gs, ps, audio) in enumerate(generator):
-            if audio is None:
-                continue
-            audio_np = audio # This is usually float32 at 24kHz
-            
-            # resample 24kHz to 16kHz (polyphase is faster)
-            resampled_audio = scipy.signal.resample_poly(audio_np, 16000, 24000)
-            
-            # convert to 16-bit PCM with volume boost (loud version)
-            pcm_audio = (resampled_audio * 1.5 * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
+        loop = asyncio.get_event_loop()
+        pcm_chunks = await loop.run_in_executor(None, _synthesize_tts_pcm_chunks, text)
+        for pcm_audio in pcm_chunks:
             await ws.send(pcm_audio)
     except Exception as e:
         logger.error(f"TTS Error: {e}")
 
 
 # --- WS Server ---
-async def flush_turn(ws):
-    global state
+async def flush_turn(ws, conn_state: PipelineState):
     while True:
         try:
             await asyncio.sleep(0.1)
-            if state.turn_buffer and (time.time() - state.last_voice_timestamp > TURN_SILENCE_SECONDS):
-                final_transcript = state.turn_buffer.strip()
-                state.turn_buffer = ""
+            if conn_state.turn_buffer and (time.time() - conn_state.last_voice_timestamp > TURN_SILENCE_SECONDS):
+                final_transcript = conn_state.turn_buffer.strip()
+                conn_state.turn_buffer = ""
                 logger.info(f"Turn finalized: {final_transcript}")
                 # Removing "Thinking" UI update as requested
                 # await ws.send(json.dumps({"type": "llm", "text": f"Heard: {final_transcript}", "emotion": "thinking"}))
@@ -357,24 +409,21 @@ async def handle_connection(ws):
     with connected_clients_lock:
         connected_clients.add(ws)
 
-    global state
-    state.audio_buffer.clear()
-    state.turn_buffer = ""
-    state.last_voice_timestamp = 0
+    conn_state = PipelineState()
     
     # Start flush monitor
-    flush_task = asyncio.create_task(flush_turn(ws))
+    flush_task = asyncio.create_task(flush_turn(ws, conn_state))
     
     try:
          async for message in ws:
              if isinstance(message, bytes):
-                 state.audio_buffer.extend(message)
+                 conn_state.audio_buffer.extend(message)
                  
                  # Process chunks (default 1 second of audio: 32000 bytes at 16kHz 16-bit mono).
-                 if len(state.audio_buffer) >= STT_CHUNK_BYTES and not state.stt_busy:
-                     pcm_to_process = bytes(state.audio_buffer)
-                     state.audio_buffer.clear()
-                     state.stt_busy = True
+                 if len(conn_state.audio_buffer) >= STT_CHUNK_BYTES and not conn_state.stt_busy:
+                     pcm_to_process = bytes(conn_state.audio_buffer)
+                     conn_state.audio_buffer.clear()
+                     conn_state.stt_busy = True
                      loop = asyncio.get_event_loop()
                      try:
                          transcription = await loop.run_in_executor(None, process_audio_buffer, pcm_to_process)
@@ -382,12 +431,12 @@ async def handle_connection(ws):
                          logger.warning("STT chunk processing error: %s", stt_exc)
                          transcription = ""
                      finally:
-                         state.stt_busy = False
+                         conn_state.stt_busy = False
                      if transcription:
                          logger.info(f"Interim Transcription: {transcription}")
                          await ws.send(json.dumps({"type": "stt", "text": transcription, "emotion": "listening"}))
-                         state.turn_buffer += transcription + " "
-                         state.last_voice_timestamp = time.time()
+                         conn_state.turn_buffer += transcription + " "
+                         conn_state.last_voice_timestamp = time.time()
                          
              elif isinstance(message, str):
                  logger.info(f"Received text payload: {message}")
