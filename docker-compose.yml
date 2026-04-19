@@ -15,6 +15,13 @@ services:
       - ./models:/app/models
       - ./cache/huggingface:/root/.cache/huggingface
       - ./cache/ultralytics:/tmp/Ultralytics
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
   civicbot-web:
